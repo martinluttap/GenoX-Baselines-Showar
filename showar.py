@@ -59,10 +59,11 @@ class SHOWAR:
         self.stats_history = {}
         self.sample_rate_ns = 100 * 1e6  # 100ms
         self.window_len = 10  # 1sec
-        self.threshold = 0.15
+        self.thresh_perc = 0.15
 
         # State
         self.limits = {}
+        self.last_scale_t = 0
 
     def run(self):
         ctr_map = get_ctr_map(self.running_containers)
@@ -87,7 +88,7 @@ class SHOWAR:
 
         late_end_time = 0
         while True:
-            print(self.stats_history)
+            # print(self.stats_history)
             t = time.perf_counter()
             tt = (0.097 - t) * 1000 % 100 / 1000
             t += tt
@@ -143,15 +144,28 @@ class SHOWAR:
             for name in stats:
                 self.stats_history[name].append((t + monotonic_base, stats[name]))
                 self.stats_history[name] = self.stats_history[name][-self.window_len :]
-                self.calc_cpu_mean()
+                cpu_usages = self.get_cpu_usages(name)
+                mean = np.mean(cpu_usages)
+                std = np.std(cpu_usages)
+                if not self.limits[name]:
+                    self.limits[name] = np.abs(mean + (3*std))
+                else:      
+                    curr = mean + (3*std)              
+                    diff = np.abs(curr - self.limits[name]) 
+                    print(f'{name[:5]} old={self.limits[name]:.2f}, now={curr:.2f}, diff={diff:.2f}')
+                    
+                    threshold = self.thresh_perc * self.limits[name]
+                    if (diff > threshold):
+                        print(f'{name[:5]}, thres {threshold:.2f} changing from {self.limits[name]:.2f} to {curr:.2f}')
+                        self.limits[name] = curr
 
-    def calc_cpu_mean(self):
-        for name, hist in self.stats_history.items():
-            cpu_usages = []
-            for ts, stat in hist:
-                cpu_usages.append(stat["dt_cpu_usage"])
-            print(f"Mean: {np.mean(cpu_usages)}, std: {np.std(cpu_usages)}")
+    def get_cpu_usages(self, name: str) -> List[float]:
+        hist = self.stats_history[name]
+        cpu_usages = []
+        for ts, stat in hist:
+            cpu_usages.append(stat["dt_cpu_usage"])
 
+        return cpu_usages
 
 def main():
     running_ctrs: List[str] = []
