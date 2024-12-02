@@ -38,13 +38,12 @@ def set_cpu_limit(ctr_map, name, limit, period=0.1):
 
     return
 
-
 def get_running_containers(root_dir: str):
     # traverse root directory, and list directories as dirs and files as files
     ctrs: List[str] = []
     for root, dirs, files in os.walk(f"{root_dir}"):
         path = root.split(os.sep)
-        print((len(path) - 1) * "---", os.path.basename(root))
+        # print((len(path) - 1) * "---", os.path.basename(root))
         ctrs.extend(dirs)
         for file in files:
             pass
@@ -52,67 +51,100 @@ def get_running_containers(root_dir: str):
 
     return ctrs
 
-
 class SHOWAR:
-    def __init__(self, running_containers: List[str]) -> None:
-        self.running_containers = running_containers
+    def __init__(self, root_dir: str = f"/sys/fs/cgroup/cpu/docker") -> None:
+        self.running_containers = []
         self.stats_history = {}
-        self.sample_rate_ns = 100 * 1e6  # 100ms
+        self.ctr_map = {}
+        self.root_dir = root_dir
+        self.sample_rate_sec = 0.1  # 100ms
         self.window_len = 10  # 1sec
         self.thresh_perc = 0.15
 
         # State
-        self.limits = {}
-        self.last_scale_t = 0
+        self.spread = {}
+        self.last_t = 0
+
+        self.update_state()
+        # Init limits
+        for name in self.running_containers:
+            self.spread[name] = None
+            set_cpu_limit(self.ctr_map, name, None)
+
+    def update_state(self):
+        self.running_containers = get_running_containers(self.root_dir)
+        self.ctr_map = get_ctr_map(self.running_containers)
+        for name in self.running_containers:
+            if name not in self.spread:
+                self.spread[name] = None
+
+    def sleep_sample_period(self):
+        t = time.perf_counter()
+        tt = (0.097 - t) * 1000 % 100 / 1000 # 100ms
+        t += tt
+        time.sleep(tt)
+        self.last_t = t
+
+    def wait_cgroup_exist(self):
+        files_ready = False
+        to_check = ['cpuacct.usage', 'cpu.stat', 'cpu.cfs_quota_us']
+        for name in self.running_containers:
+            while not files_ready:
+                checked = []
+                for f in to_check:
+                    stat_obj = stat_path(self.ctr_map, name, f)
+                    if stat_obj.is_file():
+                        checked.append(f)
+                if len(checked) == len(to_check):
+                    files_ready = True
+                    print(f'Cgroup for {name[:5]} ready! t={self.last_t}')
+                else:
+                    print(f'Cgroup for {name[:5]} not ready, sleeping ... t={self.last_t}')
+                self.sleep_sample_period()
 
     def run(self):
-        ctr_map = get_ctr_map(self.running_containers)
-
-        for name in self.running_containers:
-            self.limits[name] = None
-            set_cpu_limit(ctr_map, name, None)
-
         files = {}
-        for name in self.running_containers:
-            files[name, "cpuacct.usage"] = stat_path(
-                ctr_map, name, "cpuacct.usage"
-            ).open()
-            files[name, "cpu.stat"] = stat_path(ctr_map, name, "cpu.stat").open()
-            files[name, "cpu.cfs_quota_us"] = stat_path(
-                ctr_map, name, "cpu.cfs_quota_us"
-            ).open()
-
         monotonic_base = time.time() - time.perf_counter()
-
         self.stats_history = collections.defaultdict(list)
-
         late_end_time = 0
         while True:
-            # print(self.stats_history)
-            t = time.perf_counter()
-            tt = (0.097 - t) * 1000 % 100 / 1000
-            t += tt
-            time.sleep(tt)
+            self.sleep_sample_period()
+            # Need to parallelize this? 
+            self.update_state()
+            if len(self.running_containers) == 0:
+                print(f'No running containers!')
+                self.sleep_sample_period()
+                continue
+            
+            for name in self.running_containers:
+                files[name, "cpuacct.usage"] = stat_path(
+                    self.ctr_map, name, "cpuacct.usage"
+                ).open()
+                files[name, "cpu.stat"] = stat_path(self.ctr_map, name, "cpu.stat").open()
+                files[name, "cpu.cfs_quota_us"] = stat_path(
+                    self.ctr_map, name, "cpu.cfs_quota_us"
+                ).open()
+                files[name, "cpu.cfs_period_us"] = stat_path(
+                    self.ctr_map, name, "cpu.cfs_period_us"
+                ).open()
 
             stats = collections.defaultdict(dict)
             for name in self.running_containers:
-                try:
-                    files[name, "cpuacct.usage"].seek(0)
-                    stats[name]["cpu_usage"] = files[name, "cpuacct.usage"].read()
-                    files[name, "cpu.stat"].seek(0)
-                    for line in files[name, "cpu.stat"].read().splitlines():
-                        k, v = line.split()
-                        stats[name][f"cpu_stat.{k}"] = v
-                    files[name, "cpu.cfs_quota_us"].seek(0)
-                    stats[name]["cpu_cfs_quota_us"] = files[
-                        name, "cpu.cfs_quota_us"
-                    ].read()
-                except Exception as e:
-                    print(f"At t={t} {name} has exception {e}, skipping ...")
-
-            end_time = time.perf_counter()
-            if end_time > t + (-t * 1000 % 100 / 1000):
-                late_end_time += 1
+                files[name, "cpuacct.usage"].seek(0)
+                assert(files[name, "cpuacct.usage"]), f"{files[name, 'cpuacct.usage']} does not exist!"
+                stats[name]["cpu_usage"] = files[name, "cpuacct.usage"].read()
+                files[name, "cpu.stat"].seek(0)
+                for line in files[name, "cpu.stat"].read().splitlines():
+                    k, v = line.split()
+                    stats[name][f"cpu_stat.{k}"] = v
+                files[name, "cpu.cfs_quota_us"].seek(0)
+                stats[name]["cpu_cfs_quota_us"] = files[
+                    name, "cpu.cfs_quota_us"
+                ].read()
+                files[name, "cpu.cfs_period_us"].seek(0)
+                stats[name]["cpu_cfs_period_us"] = files[
+                    name, "cpu.cfs_period_us"
+                ].read()
 
             for name in self.running_containers:
                 try:
@@ -138,27 +170,34 @@ class SHOWAR:
                     stats[name]["cpu_cfs_quota_us"] = int(
                         stats[name]["cpu_cfs_quota_us"]
                     )
+                    stats[name]["cpu_cfs_period_us"] = int(
+                        stats[name]["cpu_cfs_period_us"]
+                    )
                 except Exception as e:
-                    print(f"At t={t} {name} error {e}")
+                    print(f"At t={self.last_t} {name} error {e}")
 
             for name in stats:
-                self.stats_history[name].append((t + monotonic_base, stats[name]))
+                self.stats_history[name].append((self.last_t + monotonic_base, stats[name]))
                 self.stats_history[name] = self.stats_history[name][-self.window_len :]
+
+            # SCALE UP/DOWN 
+            for name in stats:
                 cpu_usages = self.get_cpu_usages(name)
                 mean = np.mean(cpu_usages)
                 std = np.std(cpu_usages)
-                if not self.limits[name]:
-                    self.limits[name] = np.abs(mean + (3*std))
+                spread = mean + (3*std)
+                target_core = spread / self.sample_rate_sec 
+                if not self.spread[name]:
+                    self.spread[name] = spread
                 else:      
-                    curr = mean + (3*std)              
-                    diff = np.abs(curr - self.limits[name]) 
-                    print(f'{name[:5]} old={self.limits[name]:.2f}, now={curr:.2f}, diff={diff:.2f}')
-                    
-                    threshold = self.thresh_perc * self.limits[name]
+                    diff = np.abs(spread - self.spread[name])
+                    threshold = self.thresh_perc * self.spread[name]
                     if (diff > threshold):
-                        print(f'{name[:5]}, thres {threshold:.2f} changing from {self.limits[name]:.2f} to {curr:.2f}')
-                        self.limits[name] = curr
-
+                        # limit -> quota_us conversion requires quota >= 1000   
+                        target_core = max((spread / self.sample_rate_sec), 0.01)
+                        set_cpu_limit(self.ctr_map, name, target_core)
+                        self.spread[name] = spread
+    
     def get_cpu_usages(self, name: str) -> List[float]:
         hist = self.stats_history[name]
         cpu_usages = []
@@ -168,13 +207,7 @@ class SHOWAR:
         return cpu_usages
 
 def main():
-    running_ctrs: List[str] = []
-    while len(running_ctrs) == 0:
-        running_ctrs = get_running_containers(f"/sys/fs/cgroup/cpu/docker")
-        print(f"Waiting for containers to start ...")
-        time.sleep(1)
-
-    showar = SHOWAR(running_containers=running_ctrs)
+    showar = SHOWAR()
     showar.run()
 
 
