@@ -59,8 +59,10 @@ class SHOWAR:
         self.stats_history = {}
         self.ctr_map = {}
         self.root_dir = root_dir
-        self.sample_rate_sec = 0.1  # 100ms
-        self.window_len = 10  # 1sec
+        self.sample_rate_sec = 1  # 20ms
+        self.scale_freq_sec = 1  # 20ms
+        self.last_scale_t = 0
+        self.window_len = 10  # 50ms
         self.thresh_perc = 0.15
 
         # State
@@ -83,9 +85,12 @@ class SHOWAR:
 
     def sleep_sample_period(self):
         t = time.perf_counter()
-        tt = (0.097 - t) * 1000 % 100 / 1000  # 100ms
+        # tt = (0.097 - t) * 1000 % 100 / 3000  # ~30ms
+        tt = self.sample_rate_sec
+        print(f'At {t:.4f} sleeping for {tt:.4f} sec ...')
         t += tt
         time.sleep(tt)
+        print(f'At {t:.4f} woke up')
         self.last_t = t
 
     def wait_cgroup_exist(self):
@@ -200,18 +205,27 @@ class SHOWAR:
                 mean = np.mean(cpu_usages)
                 std = np.std(cpu_usages)
                 spread = mean + (3 * std)
-                print(f"At t={self.last_t:.2f}, {name[:5]} spread {spread:.2f}")
                 target_core = spread / self.sample_rate_sec
+                print(f'mean={mean:.4f}, std={std:.4f}, Target core for {name[:5]}={target_core:.4f}')
                 if not self.spread[name]:
                     self.spread[name] = spread
                 else:
                     diff = np.abs(spread - self.spread[name])
                     threshold = self.thresh_perc * self.spread[name]
-                    if diff > threshold:
+                    last_scale_diff = np.abs(self.last_scale_t - self.last_t) 
+                    print(f"At t={self.last_t:.4f}, {name[:5]}, curr. spread={self.spread[name]:.4f}, obs. spread={spread:.4f}, len={len(self.stats_history[name])}, thresh={threshold:.4f}, last_scale_diff={last_scale_diff:.4f}")
+                    # hist = self.stats_history[name][-5:]
+                    # dts = []
+                    # for e in hist:
+                    #     dts.append(e[1]["dt_cpu_usage"])
+                    print(f'At t={self.last_t}, dts={cpu_usages}, mu={mean:.4f}, std={std:.4f}')
+                    if (diff > threshold) and \
+                        (last_scale_diff > self.scale_freq_sec):
                         # limit -> quota_us conversion requires quota >= 1000
                         target_core = max((spread / self.sample_rate_sec), 0.01)
                         set_cpu_limit(self.ctr_map, name, target_core)
                         self.spread[name] = spread
+                        self.last_scale_t = self.last_t
 
     def get_cpu_usages(self, name: str) -> List[float]:
         hist = self.stats_history[name]
