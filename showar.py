@@ -4,21 +4,62 @@ import datetime
 import numpy as np
 import os
 import pathlib
+import subprocess
 import time
 
 from typing import Any, Dict, List, Set
 
 
-def get_ctr_map(components):
-    ctr_map = {}
+def get_ctr_map(namespace, components):
+    # ctr_map = {}
+    # for name in components:
+    #     ctr_map[name] = f"kubepods.slice/{name}/"
+    # return ctr_map
+    name_to_uid = {}
+
+    p = subprocess.run(['kubectl', 'get', 'pods', f'-n={namespace}',
+        r'-o=jsonpath={range .items[*]}{.metadata.uid} {.metadata.name}{"\n"}{end}'],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, check=True)
+    for i in p.stdout.splitlines():
+        uid, name = i.split()
+        name = name.rsplit('-', 2)[0]
+        if name in components:
+            assert name not in name_to_uid
+            name_to_uid[name] = uid
+
+    uid_to_qos = {}
+    cgroup = pathlib.Path('/sys/fs/cgroup')
+    for qos in ['guaranteed', 'burstable', 'besteffort']:
+        d = cgroup/f'cpu/kubepods.slice/kubepods-{qos}.slice'
+        p = f'kubepods-{qos}-pod'
+        s = '.slice'
+        for i in d.glob(f'{p}*{s}'):
+            uid = i.name[len(p):-len(s)].replace('_', '-')
+            uid_to_qos[uid] = qos
+
+    pod_map = {}
     for name in components:
-        ctr_map[name] = f"docker/{name}/"
-    return ctr_map
+        uid = name_to_uid[name]
+        try:
+            qos = uid_to_qos[uid]
+        except KeyError:
+            pass
+        else:
+            pod_map[name] = qos, uid
+    return pod_map
+
+
 
 
 def stat_path(ctr_map, name, stat):
-    group = ctr_map[name]
-    return pathlib.Path(f"/sys/fs/cgroup/cpu/{group}/{stat}")
+    # group = ctr_map[name]
+    # return pathlib.Path(f"/sys/fs/cgroup/cpu/{group}/{stat}")
+
+    print(ctr_map)
+    qos, uid = ctr_map[name]
+    family, _, name = stat.partition('.')
+    slices = f'kubepods.slice/kubepods-{qos}.slice/kubepods-{qos}-pod{uid.replace("-", "_")}.slice'
+    return pathlib.Path(f'/sys/fs/cgroup/{family}/{slices}/{family}.{name}')
 
 
 def set_cpu_limit(ctr_map, name, limit, period=0.1):
@@ -54,7 +95,8 @@ def get_running_containers(root_dir: str):
 
 
 class SHOWAR:
-    def __init__(self, root_dir: str = f"/sys/fs/cgroup/cpu/docker") -> None:
+    def __init__(self, namespace: str, root_dir: str = f"/sys/fs/cgroup/cpu/kubepods.slice/") -> None:
+        self.namespace = namespace
         self.running_containers = []
         self.stats_history = {}
         self.ctr_map = {}
@@ -69,6 +111,15 @@ class SHOWAR:
         self.spread = {}
         self.last_t = 0
         self.files = {}
+        self.components = set({})
+
+        p = subprocess.run(['kubectl', 'get', 'pods', f'-n={namespace}',
+        r'-o=jsonpath={range .items[*]}{.metadata.uid} {.metadata.name}{"\n"}{end}'],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, check=True)
+        for i in p.stdout.splitlines():
+            uid, name = i.split()
+            name = '-'.join(name.split('-')[:-2]) #     name.rsplit('-', 2)[0]
+            self.components.add(name)
 
         self.update_state()
         # Init limits
@@ -77,8 +128,11 @@ class SHOWAR:
             set_cpu_limit(self.ctr_map, name, None)
 
     def update_state(self):
-        self.running_containers = get_running_containers(self.root_dir)
-        self.ctr_map = get_ctr_map(self.running_containers)
+        # self.running_containers = get_running_containers(self.root_dir)
+        self.ctr_map = get_ctr_map(self.namespace, self.components)
+        self.running_containers = self.ctr_map.keys()
+        # print(f'run: {self.running_containers}')
+        # for name in self.running_containers:
         for name in self.running_containers:
             if name not in self.spread:
                 self.spread[name] = None
@@ -237,7 +291,7 @@ class SHOWAR:
 
 
 def main():
-    showar = SHOWAR()
+    showar = SHOWAR(namespace='hotel-reservation')
     showar.run()
 
 
