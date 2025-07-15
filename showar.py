@@ -12,13 +12,15 @@ from typing import Any, Dict, List, Set
 def get_ctr_map(components):
     ctr_map = {}
     for name in components:
-        ctr_map[name] = f"docker/{name}/"
+        # ctr_map[name] = f"kubepods.slice/{name}/"
+        ctr_map[name] = f"{name}/"
     return ctr_map
 
 
 def stat_path(ctr_map, name, stat):
-    group = ctr_map[name]
-    return pathlib.Path(f"/sys/fs/cgroup/cpu/{group}/{stat}")
+    # group = ctr_map[name]
+    # return pathlib.Path(f"/sys/fs/cgroup/cpu/{group}/{stat}")
+    return pathlib.Path(f"{ctr_map[name]}/{stat}")
 
 
 def set_cpu_limit(ctr_map, name, limit, period=0.1):
@@ -44,8 +46,12 @@ def get_running_containers(root_dir: str):
     ctrs: List[str] = []
     for root, dirs, files in os.walk(f"{root_dir}"):
         path = root.split(os.sep)
-        # print((len(path) - 1) * "---", os.path.basename(root))
-        ctrs.extend(dirs)
+        print((len(path) - 1) * "---", os.path.basename(root))
+        for d in dirs:
+            if '-containerd-' in d:
+                # print(root, d)
+                ctrs.append(root + '/' + d)
+        # ctrs.extend(dirs)
         for file in files:
             pass
             # print(len(path) * '---', file)
@@ -54,7 +60,7 @@ def get_running_containers(root_dir: str):
 
 
 class SHOWAR:
-    def __init__(self, root_dir: str = f"/sys/fs/cgroup/cpu/docker") -> None:
+    def __init__(self, root_dir: str = f"/sys/fs/cgroup/cpu/kubepods.slice") -> None:
         self.running_containers = []
         self.stats_history = {}
         self.ctr_map = {}
@@ -122,6 +128,7 @@ class SHOWAR:
         for name in self.running_containers:
             for cf in cgroup_files:
                 if (name, cf) not in self.files:
+                    print(f'Opening {name},{cf}')
                     self.files[name, cf] = stat_path(self.ctr_map, name, cf).open()
 
     def get_stats(self):
@@ -206,7 +213,7 @@ class SHOWAR:
                 std = np.std(cpu_usages)
                 spread = mean + (3 * std)
                 target_core = spread / self.sample_rate_sec
-                print(f'mean={mean:.4f}, std={std:.4f}, Target core for {name[:5]}={target_core:.4f}')
+                print(f'mean={mean:.4f}, std={std:.4f}, Target core for {name.split("/")[-1].split("-")[-1][:5]}={target_core:.4f}')
                 if not self.spread[name]:
                     self.spread[name] = spread
                 else:
