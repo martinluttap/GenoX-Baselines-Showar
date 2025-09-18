@@ -6,7 +6,7 @@ import os
 import pathlib
 import subprocess
 import time
-
+import sys
 from typing import Any, Dict, List, Set
 
 
@@ -16,36 +16,86 @@ def get_ctr_map(namespace, components):
     #     ctr_map[name] = f"kubepods.slice/{name}/"
     # return ctr_map
     name_to_uid = {}
+    name_to_container_ids = {}
 
-    p = subprocess.run(['kubectl', 'get', 'pods', f'-n={namespace}',
-        r'-o=jsonpath={range .items[*]}{.metadata.uid} {.metadata.name}{"\n"}{end}'],
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, check=True)
-    for i in p.stdout.splitlines():
-        uid, name = i.split()
-        name = name.rsplit('-', 2)[0]
+    print(f"[DEBUG] Getting pods in namespace: {namespace}")
+    # Get pod details including container IDs
+    p = subprocess.run([
+        'kubectl', 'get', 'pods', f'-n={namespace}', '-o', 'json'
+    ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, check=True)
+    import json
+    pod_data = json.loads(p.stdout)
+    for item in pod_data['items']:
+        uid = item['metadata']['uid']
+        name_orig = item['metadata']['name']
+        name = name_orig.rsplit('-', 2)[0]
+        print(f"[DEBUG] Pod: name={name_orig}, parsed={name}, uid={uid}")
         if name in components:
             assert name not in name_to_uid
             name_to_uid[name] = uid
+            # Get container IDs from status
+            container_ids = []
+            statuses = item.get('status', {}).get('containerStatuses', [])
+            for status in statuses:
+                cid = status.get('containerID', '')
+                if cid.startswith('docker://'):
+                    cid = cid.replace('docker://', '')
+                if cid:
+                    container_ids.append(cid)
+            name_to_container_ids[name] = container_ids
+            print(f"[DEBUG] Container IDs for {name}: {container_ids}")
 
     uid_to_qos = {}
     cgroup = pathlib.Path('/sys/fs/cgroup')
+    found_kubepods = False
     for qos in ['guaranteed', 'burstable', 'besteffort']:
         d = cgroup/f'cpu/kubepods.slice/kubepods-{qos}.slice'
         p = f'kubepods-{qos}-pod'
         s = '.slice'
+        print(f"[DEBUG] Checking cgroup dir: {d}")
+        if not d.exists():
+            print(f"[DEBUG] Cgroup dir {d} does not exist!")
+            continue
+        found_kubepods = True
         for i in d.glob(f'{p}*{s}'):
+            print(f"[DEBUG] Found cgroup: {i}")
             uid = i.name[len(p):-len(s)].replace('_', '-')
             uid_to_qos[uid] = qos
 
     pod_map = {}
-    for name in components:
-        uid = name_to_uid[name]
-        try:
-            qos = uid_to_qos[uid]
-        except KeyError:
-            pass
-        else:
-            pod_map[name] = qos, uid
+    if found_kubepods:
+        for name in components:
+            uid = name_to_uid.get(name)
+            if not uid:
+                print(f"[DEBUG] No UID found for component {name}")
+                continue
+            try:
+                qos = uid_to_qos[uid]
+            except KeyError:
+                print(f"[DEBUG] No QoS found for UID {uid} (component {name})")
+                pass
+            else:
+                pod_map[name] = qos, uid
+    else:
+        # Docker fallback: scan for docker-*.scope in system.slice
+        docker_cgroup_dir = cgroup / 'cpu/system.slice'
+        print(f"[DEBUG] Docker fallback: scanning {docker_cgroup_dir}")
+        for i in docker_cgroup_dir.glob('docker-*.scope'):
+            print(f"[DEBUG] Found docker cgroup: {i}")
+            fname = i.name
+            # docker-<containerid>.scope
+            parts = fname.split('-')
+            if len(parts) < 2:
+                continue
+            container_id = parts[1].replace('.scope', '')
+            # Try to match container ID to pod container IDs
+            for name, cids in name_to_container_ids.items():
+                if container_id in cids:
+                    print(f"[DEBUG] Matched docker container {container_id} to pod {name}")
+                    pod_map[name] = ('docker', container_id)
+        if not pod_map:
+            print(f"[DEBUG] No docker containers matched pod container IDs. You may need to adjust matching logic.")
+    print(f"[DEBUG] pod_map: {pod_map}")
     return pod_map
 
 
@@ -101,7 +151,7 @@ class SHOWAR:
         self.stats_history = {}
         self.ctr_map = {}
         self.root_dir = root_dir
-        self.sample_rate_sec = 1  # 20ms
+        self.sample_rate_sec = 0.5  # 20ms
         self.scale_freq_sec = 1  # 20ms
         self.last_scale_t = 0
         self.window_len = 10  # 50ms
@@ -291,7 +341,8 @@ class SHOWAR:
 
 
 def main():
-    showar = SHOWAR(namespace='hotel-reservation')
+    ns=sys.argv[1] if len(sys.argv) > 1 else error("Need namespace arg")
+    showar = SHOWAR(namespace=ns)
     showar.run()
 
 
