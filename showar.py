@@ -1,3 +1,14 @@
+
+#!/usr/bin/env python3
+import collections
+import datetime
+import numpy as np
+import os
+import pathlib
+import subprocess
+import time
+import sys
+from typing import Any, Dict, List, Set
 def get_container_node_mapping(namespace: str) -> list:
     """
     Returns a list of (node_name, pod_name, container_id) for all containers in the namespace.
@@ -38,17 +49,6 @@ def get_docker_container_ids(namespace: str) -> list:
             if cid:
                 container_ids.append(cid)
     return container_ids
-#!/usr/bin/env python3
-import collections
-import datetime
-import numpy as np
-import os
-import pathlib
-import subprocess
-import time
-import sys
-from typing import Any, Dict, List, Set
-
 
 def get_ctr_map(namespace, components):
     # ctr_map = {}
@@ -145,36 +145,48 @@ def get_ctr_map(namespace, components):
 
 
 def stat_path(ctr_map, name, stat):
-    # group = ctr_map[name]
-    # return pathlib.Path(f"/sys/fs/cgroup/cpu/{group}/{stat}")
+    info = ctr_map[name]
+    paths_checked = []
+    def exists_and_log(path):
+        paths_checked.append(str(path))
+        if path.exists():
+            print(f"[DEBUG] Found cgroup file: {path}")
+            return True
+        return False
 
-    print(ctr_map)
-    # Unpack the new tuple: (node_name, pod_name, container_id)
-    node_name, pod_name, container_id = ctr_map[name]
-    family, _, stat_name = stat.partition('.')
-    # For Docker, cgroup path is /sys/fs/cgroup/cpu/system.slice/docker-<container_id>.scope/<stat>
-    cgroup_path = pathlib.Path(f'/sys/fs/cgroup/{family}/system.slice/docker-{container_id}.scope/{family}.{stat_name}')
-    return cgroup_path
+     # Only use cgroup v2 unified hierarchy
+    cgroupv2_base = pathlib.Path('/sys/fs/cgroup')
+    cgroupv2_stat = cgroupv2_base / stat
+    if cgroupv2_stat.exists():
+        print(f"[DEBUG] Found cgroup v2 file: {cgroupv2_stat}")
+    return cgroupv2_stat
+     # Try cgroup v2 pod/container layout (common in k8s with cgroup v2)
+    if len(info) == 3:
+        qos, pod_uid, container_id = info
+        v2_pod_dir = cgroupv2_base / f'kubepods.slice/kubepods-pod{pod_uid.replace("-", "_")}.slice' / container_id / stat
+        if v2_pod_dir.exists():
+            print(f"[DEBUG] Found cgroup v2 pod/container file: {v2_pod_dir}")
+            return v2_pod_dir
+    print(f"[WARNING] Cgroup v2 file missing for {name}: checked {cgroupv2_stat} and {v2_pod_dir if len(info) == 3 else ''}")
+    return cgroupv2_stat
 
 
 def set_cpu_limit(ctr_map, name, limit, period=0.1):
     period_us = round(period * 1e6)
     assert 1000 <= period_us <= 1000000
+    cpu_max_path = stat_path(ctr_map, name, "cpu.max")
+    if not cpu_max_path.exists():
+        print(f"[WARNING] Cgroup file missing for {name}: {cpu_max_path}")
+        return
     if limit is None:
-        quota_us = -1
+        # Remove limit: write "max <period_us>"
+        cpu_max_path.write_text(f"max {period_us}")
     else:
         quota_us = round(limit * period_us)
         assert quota_us >= 1000
-
-    period_path = stat_path(ctr_map, name, "cpu.cfs_period_us")
-    quota_path = stat_path(ctr_map, name, "cpu.cfs_quota_us")
-    if not period_path.exists() or not quota_path.exists():
-        print(f"[WARNING] Cgroup file(s) missing for {name}: {period_path} or {quota_path}")
-        return
-    period_path.write_text(str(period_us))
-    quota_path.write_text(str(quota_us))
+        cpu_max_path.write_text(f"{quota_us} {period_us}")
     print(
-        f"{datetime.datetime.now()} Written period={period_us},quota={quota_us} to name={name},(node,pod,container_id)={ctr_map[name]}"
+        f"{datetime.datetime.now()} Written cpu.max={cpu_max_path.read_text().strip()} to name={name},(node,pod,container_id)={ctr_map[name]}"
     )
     return
 
@@ -211,6 +223,7 @@ class SHOWAR:
         self.last_t = 0
         self.files = {}
         self.components = set({})
+        self.pod_map = get_ctr_map(namespace, self.components)
 
         # Use container-node mapping for discovery
         self.container_node_map = get_container_node_mapping(namespace)
@@ -226,7 +239,12 @@ class SHOWAR:
         self.ctr_map = {}
         for node_name, pod_name, container_id in self.container_node_map:
             name = pod_name.rsplit('-', 2)[0]
-            self.ctr_map[name] = (node_name, pod_name, container_id)
+            pod_info = self.pod_map.get(name)
+            if pod_info:
+                qos, pod_uid = pod_info
+                self.ctr_map[name] = (qos, pod_uid, container_id)
+            else:
+                self.ctr_map[name] = (node_name, pod_name, container_id)
         self.running_containers = self.ctr_map.keys()
         for name in self.running_containers:
             if name not in self.spread:
@@ -244,7 +262,7 @@ class SHOWAR:
 
     def wait_cgroup_exist(self):
         files_ready = False
-        to_check = ["cpuacct.usage", "cpu.stat", "cpu.cfs_quota_us"]
+        to_check = ["cpu.stat", "cpu.max"]
         for name in self.running_containers:
             while not files_ready:
                 checked = []
@@ -263,17 +281,15 @@ class SHOWAR:
 
     def open_cgroup_files(self):
         cgroup_files = [
-            "cpuacct.usage",
             "cpu.stat",
-            "cpu.cfs_quota_us",
-            "cpu.cfs_period_us",
+            "cpu.max",
         ]
         for name in self.running_containers:
             for cf in cgroup_files:
                 if (name, cf) not in self.files:
                     path = stat_path(self.ctr_map, name, cf)
                     if not path.exists():
-                        print(f"[WARNING] Cgroup file missing for {name}: {path}")
+                        print(f"[WARNING] Cgroup v2 file missing for {name}: {path}")
                         continue
                     self.files[name, cf] = path.open()
 
@@ -281,24 +297,23 @@ class SHOWAR:
         stats = collections.defaultdict(dict)
         for name in self.running_containers:
             missing = False
-            for cf in ["cpuacct.usage", "cpu.stat", "cpu.cfs_quota_us", "cpu.cfs_period_us"]:
+            for cf in ["cpu.stat", "cpu.max"]:
                 if (name, cf) not in self.files:
                     print(f"[WARNING] Skipping {name}: missing {cf}")
                     missing = True
                     break
             if missing:
                 continue
-            self.files[name, "cpuacct.usage"].seek(0)
-            stats[name]["cpu_usage"] = self.files[name, "cpuacct.usage"].read()
             self.files[name, "cpu.stat"].seek(0)
             for line in self.files[name, "cpu.stat"].read().splitlines():
                 k, v = line.split()
                 stats[name][f"cpu_stat.{k}"] = v
-            self.files[name, "cpu.cfs_quota_us"].seek(0)
-            stats[name]["cpu_cfs_quota_us"] = self.files[name, "cpu.cfs_quota_us"].read()
-            self.files[name, "cpu.cfs_period_us"].seek(0)
-            stats[name]["cpu_cfs_period_us"] = self.files[name, "cpu.cfs_period_us"].read()
-
+            # cpu usage in microseconds (cgroup v2: usage_usec)
+            stats[name]["cpu_usage"] = int(stats[name].get("cpu_stat.usage_usec", 0)) / 1e6
+            self.files[name, "cpu.max"].seek(0)
+            cpu_max = self.files[name, "cpu.max"].read().strip().split()
+            stats[name]["cpu_max_quota_us"] = cpu_max[0] if len(cpu_max) > 0 else "max"
+            stats[name]["cpu_max_period_us"] = cpu_max[1] if len(cpu_max) > 1 else "100000"
         return stats
 
     def run(self):
@@ -321,7 +336,7 @@ class SHOWAR:
             # Type + derive values
             for name in valid_names:
                 try:
-                    stats[name]["cpu_usage"] = int(stats[name]["cpu_usage"]) / 1e9
+                    # cpu_usage already in ms
                     stats[name]["dt_cpu_usage"] = (
                         stats[name]["cpu_usage"]
                         - self.stats_history[name][-1][1]["cpu_usage"]
@@ -330,9 +345,9 @@ class SHOWAR:
                     )
                     stats[name]["cpu_stat.nr_periods"] = int(stats[name]["cpu_stat.nr_periods"])
                     stats[name]["cpu_stat.nr_throttled"] = int(stats[name]["cpu_stat.nr_throttled"])
-                    stats[name]["cpu_stat.throttled_time"] = int(stats[name]["cpu_stat.throttled_time"]) / 1e9
-                    stats[name]["cpu_cfs_quota_us"] = int(stats[name]["cpu_cfs_quota_us"])
-                    stats[name]["cpu_cfs_period_us"] = int(stats[name]["cpu_cfs_period_us"])
+                    stats[name]["cpu_stat.throttled_time"] = int(stats[name]["cpu_stat.throttled_time"]) / 1e6
+                    stats[name]["cpu_max_quota_us"] = int(stats[name]["cpu_max_quota_us"]) if stats[name]["cpu_max_quota_us"] != "max" else -1
+                    stats[name]["cpu_max_period_us"] = int(stats[name]["cpu_max_period_us"])
                 except Exception as e:
                     print(f"At t={self.last_t} {name} error {e}")
 
