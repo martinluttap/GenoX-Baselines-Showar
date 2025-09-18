@@ -80,19 +80,22 @@ def get_ctr_map(namespace, components):
         # Docker fallback: scan for docker-*.scope in system.slice
         docker_cgroup_dir = cgroup / 'cpu/system.slice'
         print(f"[DEBUG] Docker fallback: scanning {docker_cgroup_dir}")
-        for i in docker_cgroup_dir.glob('docker-*.scope'):
-            print(f"[DEBUG] Found docker cgroup: {i}")
+        docker_cgroups = list(docker_cgroup_dir.glob('docker-*.scope'))
+        print(f"[DEBUG] All docker cgroups found:")
+        for i in docker_cgroups:
+            print(f"    {i.name}")
+        for i in docker_cgroups:
             fname = i.name
             # docker-<containerid>.scope
             parts = fname.split('-')
             if len(parts) < 2:
                 continue
             container_id = parts[1].replace('.scope', '')
-            # Try to match container ID to pod container IDs
             for name, cids in name_to_container_ids.items():
-                if container_id in cids:
-                    print(f"[DEBUG] Matched docker container {container_id} to pod {name}")
-                    pod_map[name] = ('docker', container_id)
+                for cid in cids:
+                    if container_id == cid or container_id == cid[:12]:
+                        print(f"[DEBUG] Matched docker cgroup {container_id} to pod {name} (container ID: {cid})")
+                        pod_map[name] = ('docker', container_id)
         if not pod_map:
             print(f"[DEBUG] No docker containers matched pod container IDs. You may need to adjust matching logic.")
     print(f"[DEBUG] pod_map: {pod_map}")
