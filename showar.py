@@ -1,3 +1,43 @@
+def get_container_node_mapping(namespace: str) -> list:
+    """
+    Returns a list of (node_name, pod_name, container_id) for all containers in the namespace.
+    """
+    import json
+    p = subprocess.run([
+        'kubectl', 'get', 'pods', f'-n={namespace}', '-o', 'json'
+    ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, check=True)
+    pod_data = json.loads(p.stdout)
+    mapping = []
+    for item in pod_data['items']:
+        node_name = item['spec'].get('nodeName', '')
+        pod_name = item['metadata']['name']
+        statuses = item.get('status', {}).get('containerStatuses', [])
+        for status in statuses:
+            cid = status.get('containerID', '')
+            if cid.startswith('docker://'):
+                cid = cid.replace('docker://', '')
+            if cid:
+                mapping.append((node_name, pod_name, cid))
+    return mapping
+def get_docker_container_ids(namespace: str) -> list:
+    """
+    Returns a list of Docker container IDs for all pods in the given namespace.
+    """
+    import json
+    p = subprocess.run([
+        'kubectl', 'get', 'pods', f'-n={namespace}', '-o', 'json'
+    ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, check=True)
+    pod_data = json.loads(p.stdout)
+    container_ids = []
+    for item in pod_data['items']:
+        statuses = item.get('status', {}).get('containerStatuses', [])
+        for status in statuses:
+            cid = status.get('containerID', '')
+            if cid.startswith('docker://'):
+                cid = cid.replace('docker://', '')
+            if cid:
+                container_ids.append(cid)
+    return container_ids
 #!/usr/bin/env python3
 import collections
 import datetime
@@ -109,10 +149,12 @@ def stat_path(ctr_map, name, stat):
     # return pathlib.Path(f"/sys/fs/cgroup/cpu/{group}/{stat}")
 
     print(ctr_map)
-    qos, uid = ctr_map[name]
-    family, _, name = stat.partition('.')
-    slices = f'kubepods.slice/kubepods-{qos}.slice/kubepods-{qos}-pod{uid.replace("-", "_")}.slice'
-    return pathlib.Path(f'/sys/fs/cgroup/{family}/{slices}/{family}.{name}')
+    # Unpack the new tuple: (node_name, pod_name, container_id)
+    node_name, pod_name, container_id = ctr_map[name]
+    family, _, stat_name = stat.partition('.')
+    # For Docker, cgroup path is /sys/fs/cgroup/cpu/system.slice/docker-<container_id>.scope/<stat>
+    cgroup_path = pathlib.Path(f'/sys/fs/cgroup/{family}/system.slice/docker-{container_id}.scope/{family}.{stat_name}')
+    return cgroup_path
 
 
 def set_cpu_limit(ctr_map, name, limit, period=0.1):
@@ -124,12 +166,16 @@ def set_cpu_limit(ctr_map, name, limit, period=0.1):
         quota_us = round(limit * period_us)
         assert quota_us >= 1000
 
-    stat_path(ctr_map, name, "cpu.cfs_period_us").write_text(str(period_us))
-    stat_path(ctr_map, name, "cpu.cfs_quota_us").write_text(str(quota_us))
+    period_path = stat_path(ctr_map, name, "cpu.cfs_period_us")
+    quota_path = stat_path(ctr_map, name, "cpu.cfs_quota_us")
+    if not period_path.exists() or not quota_path.exists():
+        print(f"[WARNING] Cgroup file(s) missing for {name}: {period_path} or {quota_path}")
+        return
+    period_path.write_text(str(period_us))
+    quota_path.write_text(str(quota_us))
     print(
-        f"{datetime.datetime.now()} Written period={period_us},quota={quota_us} to name={name},(qos,uid)={ctr_map[name]}"
+        f"{datetime.datetime.now()} Written period={period_us},quota={quota_us} to name={name},(node,pod,container_id)={ctr_map[name]}"
     )
-
     return
 
 
@@ -166,14 +212,9 @@ class SHOWAR:
         self.files = {}
         self.components = set({})
 
-        p = subprocess.run(['kubectl', 'get', 'pods', f'-n={namespace}',
-        r'-o=jsonpath={range .items[*]}{.metadata.uid} {.metadata.name}{"\n"}{end}'],
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, check=True)
-        for i in p.stdout.splitlines():
-            uid, name = i.split()
-            name = '-'.join(name.split('-')[:-2]) #     name.rsplit('-', 2)[0]
-            self.components.add(name)
-
+        # Use container-node mapping for discovery
+        self.container_node_map = get_container_node_mapping(namespace)
+        self.components = set([pod_name.rsplit('-', 2)[0] for _, pod_name, _ in self.container_node_map])
         self.update_state()
         # Init limits
         for name in self.running_containers:
@@ -181,11 +222,12 @@ class SHOWAR:
             set_cpu_limit(self.ctr_map, name, None)
 
     def update_state(self):
-        # self.running_containers = get_running_containers(self.root_dir)
-        self.ctr_map = get_ctr_map(self.namespace, self.components)
+        # Use container-node mapping for running containers
+        self.ctr_map = {}
+        for node_name, pod_name, container_id in self.container_node_map:
+            name = pod_name.rsplit('-', 2)[0]
+            self.ctr_map[name] = (node_name, pod_name, container_id)
         self.running_containers = self.ctr_map.keys()
-        # print(f'run: {self.running_containers}')
-        # for name in self.running_containers:
         for name in self.running_containers:
             if name not in self.spread:
                 self.spread[name] = None
@@ -229,28 +271,33 @@ class SHOWAR:
         for name in self.running_containers:
             for cf in cgroup_files:
                 if (name, cf) not in self.files:
-                    self.files[name, cf] = stat_path(self.ctr_map, name, cf).open()
+                    path = stat_path(self.ctr_map, name, cf)
+                    if not path.exists():
+                        print(f"[WARNING] Cgroup file missing for {name}: {path}")
+                        continue
+                    self.files[name, cf] = path.open()
 
     def get_stats(self):
         stats = collections.defaultdict(dict)
         for name in self.running_containers:
+            missing = False
+            for cf in ["cpuacct.usage", "cpu.stat", "cpu.cfs_quota_us", "cpu.cfs_period_us"]:
+                if (name, cf) not in self.files:
+                    print(f"[WARNING] Skipping {name}: missing {cf}")
+                    missing = True
+                    break
+            if missing:
+                continue
             self.files[name, "cpuacct.usage"].seek(0)
-            assert self.files[
-                name, "cpuacct.usage"
-            ], f"{self.files[name, 'cpuacct.usage']} does not exist!"
             stats[name]["cpu_usage"] = self.files[name, "cpuacct.usage"].read()
             self.files[name, "cpu.stat"].seek(0)
             for line in self.files[name, "cpu.stat"].read().splitlines():
                 k, v = line.split()
                 stats[name][f"cpu_stat.{k}"] = v
             self.files[name, "cpu.cfs_quota_us"].seek(0)
-            stats[name]["cpu_cfs_quota_us"] = self.files[
-                name, "cpu.cfs_quota_us"
-            ].read()
+            stats[name]["cpu_cfs_quota_us"] = self.files[name, "cpu.cfs_quota_us"].read()
             self.files[name, "cpu.cfs_period_us"].seek(0)
-            stats[name]["cpu_cfs_period_us"] = self.files[
-                name, "cpu.cfs_period_us"
-            ].read()
+            stats[name]["cpu_cfs_period_us"] = self.files[name, "cpu.cfs_period_us"].read()
 
         return stats
 
@@ -258,7 +305,6 @@ class SHOWAR:
         monotonic_base = time.time() - time.perf_counter()
         self.stats_history = collections.defaultdict(list)
         while True:
-            # Need to parallelize this?
             self.sleep_sample_period()
             self.update_state()
             if len(self.running_containers) == 0:
@@ -269,46 +315,37 @@ class SHOWAR:
             self.open_cgroup_files()
             stats = self.get_stats()
 
+            # Only process containers with valid stats
+            valid_names = [name for name in self.running_containers if name in stats]
+
             # Type + derive values
-            for name in self.running_containers:
+            for name in valid_names:
                 try:
                     stats[name]["cpu_usage"] = int(stats[name]["cpu_usage"]) / 1e9
                     stats[name]["dt_cpu_usage"] = (
                         stats[name]["cpu_usage"]
                         - self.stats_history[name][-1][1]["cpu_usage"]
-                        if name in self.stats_history
+                        if name in self.stats_history and self.stats_history[name]
                         else 0
                     )
-                    stats[name]["cpu_stat.nr_periods"] = int(
-                        stats[name]["cpu_stat.nr_periods"]
-                    )
-                    stats[name]["cpu_stat.nr_throttled"] = int(
-                        stats[name]["cpu_stat.nr_throttled"]
-                    )
-                    stats[name]["cpu_stat.throttled_time"] = (
-                        int(stats[name]["cpu_stat.throttled_time"]) / 1e9
-                    )
-                    stats[name]["cpu_stat.throttled_time"] = (
-                        int(stats[name]["cpu_stat.throttled_time"]) / 1e9
-                    )
-                    stats[name]["cpu_cfs_quota_us"] = int(
-                        stats[name]["cpu_cfs_quota_us"]
-                    )
-                    stats[name]["cpu_cfs_period_us"] = int(
-                        stats[name]["cpu_cfs_period_us"]
-                    )
+                    stats[name]["cpu_stat.nr_periods"] = int(stats[name]["cpu_stat.nr_periods"])
+                    stats[name]["cpu_stat.nr_throttled"] = int(stats[name]["cpu_stat.nr_throttled"])
+                    stats[name]["cpu_stat.throttled_time"] = int(stats[name]["cpu_stat.throttled_time"]) / 1e9
+                    stats[name]["cpu_cfs_quota_us"] = int(stats[name]["cpu_cfs_quota_us"])
+                    stats[name]["cpu_cfs_period_us"] = int(stats[name]["cpu_cfs_period_us"])
                 except Exception as e:
                     print(f"At t={self.last_t} {name} error {e}")
 
-            for name in stats:
-                self.stats_history[name].append(
-                    (self.last_t + monotonic_base, stats[name])
-                )
+            for name in valid_names:
+                self.stats_history[name].append((self.last_t + monotonic_base, stats[name]))
                 self.stats_history[name] = self.stats_history[name][-self.window_len :]
 
             # SCALE UP/DOWN
-            for name in stats:
+            for name in valid_names:
                 cpu_usages = self.get_cpu_usages(name)
+                if not cpu_usages:
+                    print(f"[WARNING] No cpu_usages for {name}, skipping scaling.")
+                    continue
                 mean = np.mean(cpu_usages)
                 std = np.std(cpu_usages)
                 spread = mean + (3 * std)
@@ -319,27 +356,21 @@ class SHOWAR:
                 else:
                     diff = np.abs(spread - self.spread[name])
                     threshold = self.thresh_perc * self.spread[name]
-                    last_scale_diff = np.abs(self.last_scale_t - self.last_t) 
+                    last_scale_diff = np.abs(self.last_scale_t - self.last_t)
                     print(f"At t={self.last_t:.4f}, {name[:5]}, curr. spread={self.spread[name]:.4f}, obs. spread={spread:.4f}, len={len(self.stats_history[name])}, thresh={threshold:.4f}, last_scale_diff={last_scale_diff:.4f}")
-                    # hist = self.stats_history[name][-5:]
-                    # dts = []
-                    # for e in hist:
-                    #     dts.append(e[1]["dt_cpu_usage"])
                     print(f'At t={self.last_t}, dts={cpu_usages}, mu={mean:.4f}, std={std:.4f}')
-                    if (diff > threshold) and \
-                        (last_scale_diff > self.scale_freq_sec):
-                        # limit -> quota_us conversion requires quota >= 1000
+                    if (diff > threshold) and (last_scale_diff > self.scale_freq_sec):
                         target_core = max((spread / self.sample_rate_sec), 0.01)
                         set_cpu_limit(self.ctr_map, name, target_core)
                         self.spread[name] = spread
                         self.last_scale_t = self.last_t
 
     def get_cpu_usages(self, name: str) -> List[float]:
-        hist = self.stats_history[name]
+        hist = self.stats_history.get(name, [])
         cpu_usages = []
         for ts, stat in hist:
-            cpu_usages.append(stat["dt_cpu_usage"])
-
+            if "dt_cpu_usage" in stat:
+                cpu_usages.append(stat["dt_cpu_usage"])
         return cpu_usages
 
 
