@@ -156,13 +156,15 @@ def stat_path(ctr_map, name, stat):
 
     cgroupv2_base = pathlib.Path('/sys/fs/cgroup')
     if len(info) == 3:
+        # Use pod UID, not pod name
         qos, pod_uid, container_id = info
+        pod_uid_str = pod_uid.replace('-', '_')
         # Per-container path
-        container_path = cgroupv2_base / f'kubepods.slice/kubepods-pod{pod_uid.replace("-", "_")}.slice' / container_id / stat
+        container_path = cgroupv2_base / f'kubepods.slice/kubepods-pod{pod_uid_str}.slice' / container_id / stat
         if exists_and_log(container_path):
             return container_path
         # Per-pod path
-        pod_path = cgroupv2_base / f'kubepods.slice/kubepods-pod{pod_uid.replace("-", "_")}.slice' / stat
+        pod_path = cgroupv2_base / f'kubepods.slice/kubepods-pod{pod_uid_str}.slice' / stat
         if exists_and_log(pod_path):
             return pod_path
     # Fallback to global (should not be used for per-container stats)
