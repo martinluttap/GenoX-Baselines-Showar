@@ -1,3 +1,27 @@
+def find_container_cgroups():
+    """
+    Return a dict mapping container name to cgroup path for all containers on the node.
+    """
+    import pathlib
+    cgroupv2_base = pathlib.Path('/sys/fs/cgroup')
+    containers = {}
+    for scope in cgroupv2_base.glob('**/*.scope'):
+        name = scope.name
+        containers[name] = scope
+    return containers
+def print_all_container_cpu_max():
+    """
+    Print cpu.max for all containers running on the current node (cgroup v2).
+    """
+    import pathlib
+    cgroupv2_base = pathlib.Path('/sys/fs/cgroup')
+    # Find all docker and containerd scope directories
+    for scope in cgroupv2_base.glob('**/*.scope'):
+        cpu_max_path = scope / 'cpu.max'
+        if cpu_max_path.exists():
+            print(f"{scope.name}: {cpu_max_path.read_text().strip()}")
+        else:
+            print(f"{scope.name}: cpu.max not found")
 
 #!/usr/bin/env python3
 import collections
@@ -8,7 +32,14 @@ import pathlib
 import subprocess
 import time
 import sys
+import logging
 from typing import Any, Dict, List, Set
+logging.basicConfig(
+    filename='showar.log',
+    filemode='a',
+    format='%(asctime)s %(levelname)s %(message)s',
+    level=logging.DEBUG
+)
 def get_container_node_mapping(namespace: str) -> list:
     """
     Returns a list of (node_name, pod_name, container_id) for all containers in the namespace.
@@ -58,7 +89,7 @@ def get_ctr_map(namespace, components):
     name_to_uid = {}
     name_to_container_ids = {}
 
-    print(f"[DEBUG] Getting pods in namespace: {namespace}")
+    logging.debug(f"Getting pods in namespace: {namespace}")
     # Get pod details including container IDs
     p = subprocess.run([
         'kubectl', 'get', 'pods', f'-n={namespace}', '-o', 'json'
@@ -69,7 +100,7 @@ def get_ctr_map(namespace, components):
         pod_uid = item['metadata']['uid']  # Always use real pod UID
         name_orig = item['metadata']['name']
         name = name_orig.rsplit('-', 2)[0]
-        print(f"[DEBUG] Pod: name={name_orig}, parsed={name}, pod_uid={pod_uid}")
+        logging.debug(f"Pod: name={name_orig}, parsed={name}, pod_uid={pod_uid}")
         if name in components:
             assert name not in name_to_uid
             name_to_uid[name] = pod_uid  # Store real pod UID
@@ -83,7 +114,7 @@ def get_ctr_map(namespace, components):
                 if cid:
                     container_ids.append(cid)
             name_to_container_ids[name] = container_ids
-            print(f"[DEBUG] Container IDs for {name}: {container_ids}")
+            logging.debug(f"Container IDs for {name}: {container_ids}")
 
     uid_to_qos = {}
     cgroup = pathlib.Path('/sys/fs/cgroup')
@@ -92,13 +123,13 @@ def get_ctr_map(namespace, components):
         d = cgroup/f'cpu/kubepods.slice/kubepods-{qos}.slice'
         p = f'kubepods-{qos}-pod'
         s = '.slice'
-        print(f"[DEBUG] Checking cgroup dir: {d}")
+        logging.debug(f"Checking cgroup dir: {d}")
         if not d.exists():
-            print(f"[DEBUG] Cgroup dir {d} does not exist!")
+            logging.info(f"[DEBUG] Cgroup dir {d} does not exist!")
             continue
         found_kubepods = True
         for i in d.glob(f'{p}*{s}'):
-            print(f"[DEBUG] Found cgroup: {i}")
+            logging.debug(f"Found cgroup: {i}")
             uid = i.name[len(p):-len(s)].replace('_', '-')
             uid_to_qos[uid] = qos
 
@@ -107,23 +138,23 @@ def get_ctr_map(namespace, components):
         for name in components:
             uid = name_to_uid.get(name)
             if not uid:
-                print(f"[DEBUG] No UID found for component {name}")
+                logging.debug(f"No UID found for component {name}")
                 continue
             try:
                 qos = uid_to_qos[uid]
             except KeyError:
-                print(f"[DEBUG] No QoS found for UID {uid} (component {name})")
+                logging.debug(f"No QoS found for UID {uid} (component {name})")
                 pass
             else:
                 pod_map[name] = qos, uid
     else:
         # Docker fallback: scan for docker-*.scope in system.slice
         docker_cgroup_dir = cgroup / 'cpu/system.slice'
-        print(f"[DEBUG] Docker fallback: scanning {docker_cgroup_dir}")
+        logging.debug(f"Docker fallback: scanning {docker_cgroup_dir}")
         docker_cgroups = list(docker_cgroup_dir.glob('docker-*.scope'))
-        print(f"[DEBUG] All docker cgroups found:")
+        logging.debug(f"All docker cgroups found:")
         for i in docker_cgroups:
-            print(f"    {i.name}")
+            logging.debug(f"    {i.name}")
         for i in docker_cgroups:
             fname = i.name
             # docker-<containerid>.scope
@@ -134,11 +165,11 @@ def get_ctr_map(namespace, components):
             for name, cids in name_to_container_ids.items():
                 for cid in cids:
                     if container_id == cid or container_id == cid[:12]:
-                        print(f"[DEBUG] Matched docker cgroup {container_id} to pod {name} (container ID: {cid})")
+                        logging.debug(f"Matched docker cgroup {container_id} to pod {name} (container ID: {cid})")
                         pod_map[name] = ('docker', container_id)
         if not pod_map:
-            print(f"[DEBUG] No docker containers matched pod container IDs. You may need to adjust matching logic.")
-    print(f"[DEBUG] pod_map: {pod_map}")
+            logging.debug(f"No docker containers matched pod container IDs. You may need to adjust matching logic.")
+    logging.debug(f"pod_map: {pod_map}")
     return pod_map
 
 
@@ -150,34 +181,35 @@ def stat_path(ctr_map, name, stat):
     def exists_and_log(path):
         paths_checked.append(str(path))
         if path.exists():
-            print(f"[DEBUG] Found cgroup file: {path}")
+            logging.info(f"[DEBUG] Found cgroup file: {path}")
             return True
         return False
 
+    import pathlib
     cgroupv2_base = pathlib.Path('/sys/fs/cgroup')
+    # If info is a PosixPath, just return info/stat
+    if isinstance(info, pathlib.Path):
+        file_path = info / stat
+        exists_and_log(file_path)
+        return file_path
+    # ...existing code for tuple logic (if needed in future)...
     if len(info) == 3:
         qos, pod_uid, container_id = info
         pod_uid_str = pod_uid.replace('-', '_')
-        qos_str = qos  # should be 'guaranteed', 'burstable', or 'besteffort'
-        # Compose cgroup v2 paths for k8s pods/containers
-        pod_dir = cgroupv2_base / f'kubepods.slice/kubepods-{qos_str}.slice/kubepods-{qos_str}-pod{pod_uid_str}.slice'
-        # Docker scope
-        docker_scope = pod_dir / f'docker-{container_id}.scope' / stat
-        if exists_and_log(docker_scope):
-            return docker_scope
-        # Containerd scope
-        containerd_scope = pod_dir / f'cri-containerd-{container_id}.scope' / stat
+        pod_slice = cgroupv2_base / f'kubepods-pod{pod_uid_str}.slice'
+        containerd_scope = pod_slice / f'cri-containerd-{container_id}.scope' / stat
         if exists_and_log(containerd_scope):
             return containerd_scope
-        # Per-pod path
-        pod_path = pod_dir / stat
+        docker_scope = pod_slice / f'docker-{container_id}.scope' / stat
+        if exists_and_log(docker_scope):
+            return docker_scope
+        pod_path = pod_slice / stat
         if exists_and_log(pod_path):
             return pod_path
-    # Fallback to global (should not be used for per-container stats)
     global_path = cgroupv2_base / stat
     if exists_and_log(global_path):
         return global_path
-    print(f"[WARNING] Cgroup v2 file missing for {name}: checked {paths_checked}")
+    logging.info(f"[WARNING] Cgroup v2 file missing for {name}: checked {paths_checked}")
     return global_path
 
 
@@ -186,7 +218,7 @@ def set_cpu_limit(ctr_map, name, limit, period=0.1):
     assert 1000 <= period_us <= 1000000
     cpu_max_path = stat_path(ctr_map, name, "cpu.max")
     if not cpu_max_path.exists():
-        print(f"[WARNING] Cgroup file missing for {name}: {cpu_max_path}")
+        logging.info(f"[WARNING] Cgroup file missing for {name}: {cpu_max_path}")
         return
     if limit is None:
         # Remove limit: write "max <period_us>"
@@ -195,7 +227,7 @@ def set_cpu_limit(ctr_map, name, limit, period=0.1):
         quota_us = round(limit * period_us)
         assert quota_us >= 1000
         cpu_max_path.write_text(f"{quota_us} {period_us}")
-    print(
+    logging.info(
         f"{datetime.datetime.now()} Written cpu.max={cpu_max_path.read_text().strip()} to name={name},(node,pod,container_id)={ctr_map[name]}"
     )
     return
@@ -206,22 +238,20 @@ def get_running_containers(root_dir: str):
     ctrs: List[str] = []
     for root, dirs, files in os.walk(f"{root_dir}"):
         path = root.split(os.sep)
-        # print((len(path) - 1) * "---", os.path.basename(root))
+        # logging.info((len(path) - 1) * "---", os.path.basename(root))
         ctrs.extend(dirs)
         for file in files:
             pass
-            # print(len(path) * '---', file)
+            # logging.info(len(path) * '---', file)
 
     return ctrs
 
 
 class SHOWAR:
-    def __init__(self, namespace: str, root_dir: str = f"/sys/fs/cgroup/cpu/kubepods.slice/") -> None:
-        self.namespace = namespace
+    def __init__(self):
         self.running_containers = []
         self.stats_history = {}
         self.ctr_map = {}
-        self.root_dir = root_dir
         self.sample_rate_sec = 0.5  # 20ms
         self.scale_freq_sec = 1  # 20ms
         self.last_scale_t = 0
@@ -232,30 +262,17 @@ class SHOWAR:
         self.spread = {}
         self.last_t = 0
         self.files = {}
-        self.components = set({})
-        self.pod_map = get_ctr_map(namespace, self.components)
 
-        # Use container-node mapping for discovery
-        self.container_node_map = get_container_node_mapping(namespace)
-        self.components = set([pod_name.rsplit('-', 2)[0] for _, pod_name, _ in self.container_node_map])
-        self.update_state()
-        # Init limits
+        # Discover containers on node
+        self.ctr_map = find_container_cgroups()
+        self.running_containers = list(self.ctr_map.keys())
         for name in self.running_containers:
             self.spread[name] = None
-            set_cpu_limit(self.ctr_map, name, None)
 
     def update_state(self):
-        # Use container-node mapping for running containers
-        self.ctr_map = {}
-        for node_name, pod_name, container_id in self.container_node_map:
-            name = pod_name.rsplit('-', 2)[0]
-            pod_info = self.pod_map.get(name)
-            if pod_info:
-                qos, pod_uid = pod_info
-                self.ctr_map[name] = (qos, pod_uid, container_id)
-            else:
-                self.ctr_map[name] = (node_name, pod_name, container_id)
-        self.running_containers = self.ctr_map.keys()
+        # Refresh container cgroups
+        self.ctr_map = find_container_cgroups()
+        self.running_containers = list(self.ctr_map.keys())
         for name in self.running_containers:
             if name not in self.spread:
                 self.spread[name] = None
@@ -264,10 +281,10 @@ class SHOWAR:
         t = time.perf_counter()
         # tt = (0.097 - t) * 1000 % 100 / 3000  # ~30ms
         tt = self.sample_rate_sec
-        print(f'At {t:.4f} sleeping for {tt:.4f} sec ...')
+        logging.info(f'At {t:.4f} sleeping for {tt:.4f} sec ...')
         t += tt
         time.sleep(tt)
-        print(f'At {t:.4f} woke up')
+        logging.info(f'At {t:.4f} woke up')
         self.last_t = t
 
     def wait_cgroup_exist(self):
@@ -282,26 +299,24 @@ class SHOWAR:
                         checked.append(f)
                 if len(checked) == len(to_check):
                     files_ready = True
-                    print(f"Cgroup for {name[:5]} ready! t={self.last_t}")
+                    logging.info(f"Cgroup for {name[:5]} ready! t={self.last_t}")
                 else:
-                    print(
+                    logging.info(
                         f"Cgroup for {name[:5]} not ready, sleeping ... t={self.last_t}"
                     )
                 self.sleep_sample_period()
 
     def open_cgroup_files(self):
-        cgroup_files = [
-            "cpu.stat",
-            "cpu.max",
-        ]
+        cgroup_files = ["cpu.stat", "cpu.max"]
         for name in self.running_containers:
+            cgroup_path = self.ctr_map[name]
             for cf in cgroup_files:
+                file_path = cgroup_path / cf
                 if (name, cf) not in self.files:
-                    path = stat_path(self.ctr_map, name, cf)
-                    if not path.exists():
-                        print(f"[WARNING] Cgroup v2 file missing for {name}: {path}")
+                    if not file_path.exists():
+                        logging.info(f"[WARNING] Cgroup v2 file missing for {name}: {file_path}")
                         continue
-                    self.files[name, cf] = path.open()
+                    self.files[name, cf] = file_path.open()
 
     def get_stats(self):
         stats = collections.defaultdict(dict)
@@ -309,7 +324,7 @@ class SHOWAR:
             missing = False
             for cf in ["cpu.stat", "cpu.max"]:
                 if (name, cf) not in self.files:
-                    print(f"[WARNING] Skipping {name}: missing {cf}")
+                    logging.info(f"[WARNING] Skipping {name}: missing {cf}")
                     missing = True
                     break
             if missing:
@@ -333,7 +348,7 @@ class SHOWAR:
             self.sleep_sample_period()
             self.update_state()
             if len(self.running_containers) == 0:
-                print(f"No running containers!")
+                logging.info(f"No running containers!")
                 self.sleep_sample_period()
                 continue
 
@@ -353,13 +368,13 @@ class SHOWAR:
                         if name in self.stats_history and self.stats_history[name]
                         else 0
                     )
-                    stats[name]["cpu_stat.nr_periods"] = int(stats[name]["cpu_stat.nr_periods"])
-                    stats[name]["cpu_stat.nr_throttled"] = int(stats[name]["cpu_stat.nr_throttled"])
-                    stats[name]["cpu_stat.throttled_time"] = int(stats[name]["cpu_stat.throttled_time"]) / 1e6
+                    stats[name]["cpu_stat.nr_periods"] = int(stats[name].get("cpu_stat.nr_periods", 0))
+                    stats[name]["cpu_stat.nr_throttled"] = int(stats[name].get("cpu_stat.nr_throttled", 0))
+                    stats[name]["cpu_stat.throttled_time"] = int(stats[name].get("cpu_stat.throttled_time", 0)) / 1e6
                     stats[name]["cpu_max_quota_us"] = int(stats[name]["cpu_max_quota_us"]) if stats[name]["cpu_max_quota_us"] != "max" else -1
                     stats[name]["cpu_max_period_us"] = int(stats[name]["cpu_max_period_us"])
                 except Exception as e:
-                    print(f"At t={self.last_t} {name} error {e}")
+                    logging.info(f"At t={self.last_t} {name} error {e}")
 
             for name in valid_names:
                 self.stats_history[name].append((self.last_t + monotonic_base, stats[name]))
@@ -369,21 +384,21 @@ class SHOWAR:
             for name in valid_names:
                 cpu_usages = self.get_cpu_usages(name)
                 if not cpu_usages:
-                    print(f"[WARNING] No cpu_usages for {name}, skipping scaling.")
+                    logging.info(f"[WARNING] No cpu_usages for {name}, skipping scaling.")
                     continue
                 mean = np.mean(cpu_usages)
                 std = np.std(cpu_usages)
                 spread = mean + (3 * std)
                 target_core = spread / self.sample_rate_sec
-                print(f'mean={mean:.4f}, std={std:.4f}, Target core for {name[:5]}={target_core:.4f}')
+                logging.info(f'mean={mean:.4f}, std={std:.4f}, Target core for {name[:5]}={target_core:.4f}')
                 if not self.spread[name]:
                     self.spread[name] = spread
                 else:
                     diff = np.abs(spread - self.spread[name])
                     threshold = self.thresh_perc * self.spread[name]
                     last_scale_diff = np.abs(self.last_scale_t - self.last_t)
-                    print(f"At t={self.last_t:.4f}, {name[:5]}, curr. spread={self.spread[name]:.4f}, obs. spread={spread:.4f}, len={len(self.stats_history[name])}, thresh={threshold:.4f}, last_scale_diff={last_scale_diff:.4f}")
-                    print(f'At t={self.last_t}, dts={cpu_usages}, mu={mean:.4f}, std={std:.4f}')
+                    logging.info(f"At t={self.last_t:.4f}, {name[:5]}, curr. spread={self.spread[name]:.4f}, obs. spread={spread:.4f}, len={len(self.stats_history[name])}, thresh={threshold:.4f}, last_scale_diff={last_scale_diff:.4f}")
+                    logging.info(f'At t={self.last_t}, dts={cpu_usages}, mu={mean:.4f}, std={std:.4f}')
                     if (diff > threshold) and (last_scale_diff > self.scale_freq_sec):
                         target_core = max((spread / self.sample_rate_sec), 0.01)
                         set_cpu_limit(self.ctr_map, name, target_core)
@@ -400,8 +415,7 @@ class SHOWAR:
 
 
 def main():
-    ns=sys.argv[1] if len(sys.argv) > 1 else error("Need namespace arg")
-    showar = SHOWAR(namespace=ns)
+    showar = SHOWAR()
     showar.run()
 
 
