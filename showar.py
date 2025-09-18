@@ -66,13 +66,13 @@ def get_ctr_map(namespace, components):
     import json
     pod_data = json.loads(p.stdout)
     for item in pod_data['items']:
-        uid = item['metadata']['uid']
+        pod_uid = item['metadata']['uid']  # Always use real pod UID
         name_orig = item['metadata']['name']
         name = name_orig.rsplit('-', 2)[0]
-        print(f"[DEBUG] Pod: name={name_orig}, parsed={name}, uid={uid}")
+        print(f"[DEBUG] Pod: name={name_orig}, parsed={name}, pod_uid={pod_uid}")
         if name in components:
             assert name not in name_to_uid
-            name_to_uid[name] = uid
+            name_to_uid[name] = pod_uid  # Store real pod UID
             # Get container IDs from status
             container_ids = []
             statuses = item.get('status', {}).get('containerStatuses', [])
