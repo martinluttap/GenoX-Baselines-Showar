@@ -156,15 +156,21 @@ def stat_path(ctr_map, name, stat):
 
     cgroupv2_base = pathlib.Path('/sys/fs/cgroup')
     if len(info) == 3:
-        # Use pod UID, not pod name
         qos, pod_uid, container_id = info
         pod_uid_str = pod_uid.replace('-', '_')
-        # Per-container path
-        container_path = cgroupv2_base / f'kubepods.slice/kubepods-pod{pod_uid_str}.slice' / container_id / stat
-        if exists_and_log(container_path):
-            return container_path
+        qos_str = qos  # should be 'guaranteed', 'burstable', or 'besteffort'
+        # Compose cgroup v2 paths for k8s pods/containers
+        pod_dir = cgroupv2_base / f'kubepods.slice/kubepods-{qos_str}.slice/kubepods-{qos_str}-pod{pod_uid_str}.slice'
+        # Docker scope
+        docker_scope = pod_dir / f'docker-{container_id}.scope' / stat
+        if exists_and_log(docker_scope):
+            return docker_scope
+        # Containerd scope
+        containerd_scope = pod_dir / f'cri-containerd-{container_id}.scope' / stat
+        if exists_and_log(containerd_scope):
+            return containerd_scope
         # Per-pod path
-        pod_path = cgroupv2_base / f'kubepods.slice/kubepods-pod{pod_uid_str}.slice' / stat
+        pod_path = pod_dir / stat
         if exists_and_log(pod_path):
             return pod_path
     # Fallback to global (should not be used for per-container stats)
