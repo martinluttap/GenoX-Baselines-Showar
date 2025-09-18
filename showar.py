@@ -154,21 +154,23 @@ def stat_path(ctr_map, name, stat):
             return True
         return False
 
-     # Only use cgroup v2 unified hierarchy
     cgroupv2_base = pathlib.Path('/sys/fs/cgroup')
-    cgroupv2_stat = cgroupv2_base / stat
-    if cgroupv2_stat.exists():
-        print(f"[DEBUG] Found cgroup v2 file: {cgroupv2_stat}")
-    return cgroupv2_stat
-     # Try cgroup v2 pod/container layout (common in k8s with cgroup v2)
     if len(info) == 3:
         qos, pod_uid, container_id = info
-        v2_pod_dir = cgroupv2_base / f'kubepods.slice/kubepods-pod{pod_uid.replace("-", "_")}.slice' / container_id / stat
-        if v2_pod_dir.exists():
-            print(f"[DEBUG] Found cgroup v2 pod/container file: {v2_pod_dir}")
-            return v2_pod_dir
-    print(f"[WARNING] Cgroup v2 file missing for {name}: checked {cgroupv2_stat} and {v2_pod_dir if len(info) == 3 else ''}")
-    return cgroupv2_stat
+        # Per-container path
+        container_path = cgroupv2_base / f'kubepods.slice/kubepods-pod{pod_uid.replace("-", "_")}.slice' / container_id / stat
+        if exists_and_log(container_path):
+            return container_path
+        # Per-pod path
+        pod_path = cgroupv2_base / f'kubepods.slice/kubepods-pod{pod_uid.replace("-", "_")}.slice' / stat
+        if exists_and_log(pod_path):
+            return pod_path
+    # Fallback to global (should not be used for per-container stats)
+    global_path = cgroupv2_base / stat
+    if exists_and_log(global_path):
+        return global_path
+    print(f"[WARNING] Cgroup v2 file missing for {name}: checked {paths_checked}")
+    return global_path
 
 
 def set_cpu_limit(ctr_map, name, limit, period=0.1):
